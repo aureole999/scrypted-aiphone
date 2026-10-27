@@ -1,0 +1,15 @@
+node_modules/
+dist/
+build/
+*.tgz
+.env
+credentials*.json
+out/
+.DS_Store
+coverage/
+*.log
+*.pem
+*.key
+*.p12
+.env.*
+cred*.json
