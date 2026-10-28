@@ -69,6 +69,15 @@ test('real WebRTC monitor forwards video RTP and gates microphone until acceptan
         assert.equal(remote.messages.includes('23022'), false);
         await session.answer();
         assert.equal(session.accepted, true);
+        assert.equal(session.talkAudioReady, false);
+        const audioReady = new Deferred<void>();
+        const changed = () => { if (session.talkAudioReady) audioReady.resolve(); };
+        session.on('state', changed);
+        remote.audio.writeRtp(new RtpPacket(new RtpHeader({ payloadType: 0, ssrc: 1235,
+            sequenceNumber: 1, timestamp: 160 }), Buffer.alloc(160, 0xff)));
+        await withTimeout(audioReady.promise, 3000, 'First call audio did not update status');
+        session.off('state', changed);
+        assert.equal(session.talkAudioReady, true);
         for (let i = 0; i < 5; i++) session.uplink!.push(Buffer.alloc(160, 0x55));
         await new Promise(resolve => setTimeout(resolve, 200));
         assert(remote.receivedAudio.some(data => data.equals(Buffer.alloc(160, 0x55))), 'accepted PCMU microphone should reach remote WebRTC peer');
@@ -242,67 +251,82 @@ test('monitor microphone requires an explicit 24022 RSLT=200', async () => {
     assert.equal(session.closed, true);
 });
 
-test('reply readiness requires accepted talk, connected media, and fresh doorbell audio', async () => {
+test('reply readiness waits on post-answer audio and media connection events', async () => {
     const signaling: Signaling = { credentials, log() {}, send() {}, ended() {}, answered() {},
         request: async () => ({ HEADER: {} }) };
     const session = new AiphoneSession(signaling, 'reply-ready', 'ring');
     session.uplink = new AudioUplink();
     const publisher = { connectionState: 'connecting' }, subscriber = { connectionState: 'connected' };
     Object.assign(session, { publisher, subscriber });
+    const packet = new RtpPacket(new RtpHeader({ payloadType: 0 }), Buffer.alloc(160, 0xff));
+    const receive = () => (session as any).receiveAudio(packet);
     try {
         await assert.rejects(session.waitForReplyAudio(), /not been accepted/);
+        receive();
         session.accepted = true; session.uplink.enabled = true;
         let ready = false;
         const waiting = session.waitForReplyAudio(undefined, 2000).then(() => { ready = true; });
-        session.audioLastReceivedAt = Date.now();
         await new Promise(resolve => setTimeout(resolve, 60));
-        assert.equal(ready, false, 'acceptance and downlink do not imply a connected publisher');
-        publisher.connectionState = 'connected'; session.audioLastReceivedAt = Date.now() - 1000;
+        assert.equal(ready, false, 'monitor audio before acceptance must not count');
+        receive();
         await new Promise(resolve => setTimeout(resolve, 60));
-        assert.equal(ready, false, 'stale preview audio must not release the recording');
-        Object.assign(session, { acceptedAt: Date.now() + 1000 }); session.audioLastReceivedAt = Date.now();
+        assert.equal(ready, false, 'first call audio does not imply a connected publisher');
+        publisher.connectionState = 'connected'; session.emit('state');
         await new Promise(resolve => setTimeout(resolve, 60));
-        assert.equal(ready, false, 'audio before the answer acknowledgement must not release the recording');
-        Object.assign(session, { acceptedAt: Date.now() }); session.audioLastReceivedAt = Date.now();
-        await waiting; assert.equal(ready, true);
+        assert.equal(ready, false, 'retain the brief settling period before playback');
+        await waiting;
+        assert.equal(ready, true);
+        assert.equal(session.listenerCount('state'), 0);
+        assert.equal(session.listenerCount('close'), 0);
         session.audioLastReceivedAt = undefined;
-        await assert.rejects(session.waitForReplyAudio(undefined, 40), /waiting for call audio/);
+        await session.waitForReplyAudio();  // A later audio gap does not reset readiness.
         const abort = new AbortController();
         const cancelled = session.waitForReplyAudio(abort.signal); abort.abort();
         await assert.rejects(cancelled, /cancelled/);
-        const closed = session.waitForReplyAudio(); session.closed = true;
+        assert.equal(session.listenerCount('state'), 0);
+        const closed = session.waitForReplyAudio(); session.closed = true; session.emit('close');
         await assert.rejects(closed, /has ended/);
+        assert.equal(session.listenerCount('state'), 0);
+        assert.equal(session.listenerCount('close'), 0);
     } finally { session.uplink.close(); }
 });
 
-test('talk UI readiness requires post-answer audio, connected peers and a stable interval, even for silence', async () => {
+test('reply wait times out without first audio and removes temporary listeners', async () => {
+    const signaling: Signaling = { credentials, log() {}, send() {}, ended() {}, answered() {},
+        request: async () => ({ HEADER: {} }) };
+    const session = new AiphoneSession(signaling, 'no-audio', 'monitor');
+    session.accepted = true;
+    session.uplink = new AudioUplink(); session.uplink.enabled = true;
+    try {
+        await assert.rejects(session.waitForReplyAudio(undefined, 30), /waiting for call audio/);
+        assert.equal(session.listenerCount('state'), 0);
+        assert.equal(session.listenerCount('close'), 0);
+    } finally { session.uplink.close(); }
+});
+
+test('first post-answer packet confirms audio once and later packet gaps do not reset it', () => {
     const signaling: Signaling = { credentials, log() {}, send() {}, ended() {}, answered() {},
         request: async () => ({ HEADER: {} }) };
     const session = new AiphoneSession(signaling, 'talk-state', 'monitor');
-    session.uplink = new AudioUplink();
-    const publisher = { connectionState: 'connecting' }, subscriber = { connectionState: 'connected' };
-    Object.assign(session, { publisher, subscriber, acceptedAt: Date.now() });
-    try {
-        session.audioLastReceivedAt = Date.now();
-        assert.equal(session.talkAudioReady, false);
-        session.accepted = true; session.uplink.enabled = true;
-        assert.equal(session.talkAudioReady, false, 'connecting publisher is not ready');
-        publisher.connectionState = 'connected';
-        session.audioLastReceivedAt = Date.now() - 1000;
-        assert.equal(session.talkAudioReady, false, 'preview packets before answer must not count');
-        session.audioLastReceivedAt = Date.now(); session.audioLevelDb = -96;
-        assert.equal(session.talkAudioReady, false, 'new route must settle first');
-        await new Promise(resolve => setTimeout(resolve, 330));
-        assert.equal(session.talkAudioReady, true, 'silent RTP still means an active audio route');
-        session.audioLastReceivedAt = Date.now() - 3000;
-        assert.equal(session.talkAudioReady, false, 'a stalled downlink must not remain ready');
-        session.audioLastReceivedAt = Date.now();
-        assert.equal(session.talkAudioReady, false, 'recovery also waits for a stable route');
-        await new Promise(resolve => setTimeout(resolve, 330));
-        assert.equal(session.talkAudioReady, true);
-        subscriber.connectionState = 'disconnected';
-        assert.equal(session.talkAudioReady, false);
-        session.closed = true;
-        assert.equal(session.talkAudioReady, false);
-    } finally { session.uplink.close(); }
+    const packet = new RtpPacket(new RtpHeader({ payloadType: 0 }), Buffer.alloc(160, 0xff));
+    const receive = () => (session as any).receiveAudio(packet);
+    let updates = 0;
+    session.on('state', () => updates++);
+    receive();
+    assert.equal(session.talkAudioReady, false);
+    assert.equal(updates, 0);
+    session.accepted = true;
+    assert.equal(session.talkAudioReady, false, 'preview audio cannot confirm an accepted call');
+    receive();
+    assert.equal(session.audioLevelDb, -96);
+    assert.equal(session.talkAudioReady, true, 'a silent packet also confirms the audio route');
+    assert.equal(updates, 1);
+    receive(); receive();
+    assert.equal(updates, 1, 'later audio packets do not trigger status refreshes');
+    session.audioLastReceivedAt = Date.now() - 60000;
+    assert.equal(session.talkAudioReady, true);
+    assert.equal(updates, 1);
+    session.closed = true;
+    assert.equal(session.talkAudioReady, false);
+    assert.equal(new AiphoneSession(signaling, 'next-call', 'monitor').talkAudioReady, false);
 });

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.21 - 2026-10-29
+
+- Update call status from events instead of polling.
+- Confirm call audio on the first packet after acceptance, without ongoing interruption checks.
+- Wait for quick-reply audio readiness using events.
+
 ## 0.1.20 - 2026-10-27
 
 Initial public release.

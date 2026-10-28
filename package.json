@@ -1,6 +1,6 @@
 {
   "name": "scrypted-aiphone",
-  "version": "0.1.20",
+  "version": "0.1.21",
   "description": "Aiphone WP-2MED video doorbell integration for Scrypted",
   "license": "MIT",
   "main": "dist/main.nodejs.js",

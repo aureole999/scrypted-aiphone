@@ -39,7 +39,6 @@ const tick = () => new Promise(resolve => setImmediate(resolve));
 function camera(extra: object = {}) {
     return Object.assign(Object.create(Doorbell.prototype), {
         audioGeneration: 0, replyGeneration: 0, replyRunning: false, startingAudio: false,
-        microphoneFrameBaseline: 0, microphoneReadyOnce: false,
         accessoryOptions: () => ({ unlock: false, reply: true }), settingsChanged: async () => {}, ringChanged: () => {},
         _console: { log() {}, error() {} }, _storage: { getItem: () => '' }, ...extra,
     });
@@ -194,34 +193,44 @@ test('doorbell status follows live sessions, incoming rings, replies, and discon
     assert.equal(await status(), 'Offline');
 });
 
-test('microphone status distinguishes requesting, accepted, actual audio readiness, interruption and muted calls', async () => {
+test('microphone status needs only first downlink audio and does not inspect later uplink activity', async () => {
     const session: any = { accepted: false, closed: false, talkAudioReady: false,
-        uplink: { framesSent: 42, lastFrameSentAt: Date.now() } };
+        uplink: { framesSent: 42, lastFrameSentAt: Date.now() - 60000 } };
     const controller = { online: true, state: 'ringing', session };
-    const c = camera({ controller, startingAudio: true, audioOwner: 'microphone', microphoneFrameBaseline: 42 });
+    const c = camera({ controller, startingAudio: true, audioOwner: 'microphone' });
     const status = async () => (await c.getSettings()).find((s: any) => s.key === 'call').value;
-    assert.equal(await status(), 'Requesting call', 'microphone intent must override an incoming ring');
+    assert.equal(await status(), 'Requesting call');
     session.accepted = true;
-    assert.equal(await status(), 'Connecting audio', 'answered does not imply ready media');
+    assert.equal(await status(), 'Connecting audio');
     c.startingAudio = false; c.audio = {}; c.audioSession = session;
     session.talkAudioReady = true;
-    assert.equal(await status(), 'Connecting audio', 'old microphone/reply frames must not count for a new microphone');
-    session.uplink.framesSent++;
-    assert.equal(await status(), 'In call');
-    session.talkAudioReady = false;
-    assert.equal(await status(), 'Audio interrupted');
-    session.talkAudioReady = true;
-    assert.equal(await status(), 'In call');
-    session.uplink.lastFrameSentAt = Date.now() - 3000;
-    assert.equal(await status(), 'Audio interrupted', 'downlink alone cannot prove current microphone audio');
-    session.uplink.lastFrameSentAt = Date.now();
-    assert.equal(await status(), 'In call');
+    assert.equal(await status(), 'In call', 'first downlink packet is sufficient');
+    session.uplink.framesSent = 0;
+    assert.equal(await status(), 'In call', 'no continuous microphone-frame checks');
     c.audioOwner = undefined; c.audio = undefined;
     assert.equal(await status(), 'Answered (mic off)');
     session.accepted = false; session.answering = true;
-    assert.equal(await status(), 'Requesting call', 'non-player answer requests share the same state');
+    assert.equal(await status(), 'Requesting call');
     session.closed = true; session.answering = false; controller.state = 'idle';
     assert.equal(await status(), 'Idle');
+});
+
+test('session state events refresh settings without a status polling interval', async () => {
+    const session = Object.assign(new EventEmitter(), { accepted: false, closed: false, talkAudioReady: false });
+    const controller = { online: true, state: 'idle', session };
+    const states: string[] = [];
+    const c = camera({ controller, audioOwner: 'microphone', audio: {}, audioSession: session });
+    c.settingsChanged = async () => { c.lastStatus = c.statusText(); states.push(c.doorbellState()); };
+    c.lastStatus = c.statusText();
+    const unbind = c.bindSessionStatus(session);
+    session.accepted = true; session.emit('state');
+    session.talkAudioReady = true; session.emit('state');
+    session.emit('state');
+    assert.deepEqual(states, ['Connecting audio', 'In call']);
+    unbind();
+    assert.equal(session.listenerCount('state'), 0);
+    session.closed = true; session.emit('state');
+    assert.deepEqual(states, ['Connecting audio', 'In call']);
 });
 
 test('custom reply path moves to plugin configuration and preserves camera storage', async () => {

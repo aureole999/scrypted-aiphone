@@ -59,7 +59,7 @@ export function renderOsd(image: Buffer, state: OsdState, live: boolean, connect
     const connection = state.online ? 'Connected' : 'Offline';
     const call = connecting && state.online && state.call === 'Idle' ? 'Connecting' : state.call;
     text(output, `${connection} | ${call}`, 14, 39,
-        !state.online || call === 'Audio interrupted' ? [255, 138, 138]
+        !state.online ? [255, 138, 138]
             : /Ringing|Requesting|Connecting|Preparing|mic off/.test(call) ? [255, 211, 113] : [143, 231, 189]);
     const footer = live ? state.videoStalled ? 'Live | Waiting for video' : `Live | ${osdTime(now)} JST`
         : state.capturedAt ? `Snapshot | ${osdTime(state.capturedAt)} JST` : 'Snapshot | No image available';

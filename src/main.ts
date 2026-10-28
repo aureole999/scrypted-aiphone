@@ -37,8 +37,6 @@ export class Doorbell extends ScryptedDeviceBase implements Camera, VideoCamera,
     private audioOwner?: 'microphone' | 'reply';
     private audioCompletion?: Deferred<void>;
     private microphoneStart?: Promise<{ done: Promise<void> }>;
-    private microphoneFrameBaseline = 0;
-    private microphoneReadyOnce = false;
     private pausedMicrophone?: {
         child: ChildProcessWithoutNullStreams; session: AiphoneSession; completion: Deferred<void>;
     };
@@ -77,12 +75,10 @@ export class Doorbell extends ScryptedDeviceBase implements Camera, VideoCamera,
         this.controller.on('video', (session: AiphoneSession) => {
             this.console.log(`Video ready: ${session.kind}`);
             const diagnostics = setInterval(() => this.logAudioStats(session), 15000);
-            const statusUpdates = setInterval(() => {
-                if (this.statusText() !== this.lastStatus) void this.settingsChanged().catch(() => {});
-            }, 250);
+            const removeStatusListener = this.bindSessionStatus(session);
             session.once('close', () => {
                 clearInterval(diagnostics);
-                clearInterval(statusUpdates);
+                removeStatusListener();
                 this.logAudioStats(session);
                 if (this.snapshotCache.capturedAt)
                     this.console.log(`Snapshot captured: ${new Date(this.snapshotCache.capturedAt).toLocaleString('en-GB', { timeZone: 'Asia/Tokyo', hour12: false })} JST`);
@@ -132,15 +128,17 @@ export class Doorbell extends ScryptedDeviceBase implements Camera, VideoCamera,
         if (this.controller.state === 'ringing' && !session?.accepted) return 'Ringing';
         if (session && !session.closed) {
             if (!session.accepted) return 'Monitoring';
-            const mediaReady = session.talkAudioReady;
-            if (!microphone) return mediaReady ? 'Answered (mic off)' : 'Connecting audio';
-            const uplink = session.uplink;
-            const sending = this.audioSession === session && (uplink?.framesSent || 0) > this.microphoneFrameBaseline
-                && uplink?.lastFrameSentAt !== undefined && Date.now() - uplink.lastFrameSentAt <= 1500;
-            if (mediaReady && sending) { this.microphoneReadyOnce = true; return 'In call'; }
-            return this.microphoneReadyOnce ? 'Audio interrupted' : 'Connecting audio';
+            if (!session.talkAudioReady) return 'Connecting audio';
+            return microphone ? 'In call' : 'Answered (mic off)';
         }
         return 'Idle';
+    }
+    private bindSessionStatus(session: AiphoneSession) {
+        const changed = () => {
+            if (this.statusText() !== this.lastStatus) void this.settingsChanged().catch(() => {});
+        };
+        session.on('state', changed);
+        return () => session.off('state', changed);
     }
     private logAudioStats(session: AiphoneSession) {
         this.console.log(`Audio statistics: ${JSON.stringify(session.audioDiagnostics)}`);
@@ -237,7 +235,6 @@ export class Doorbell extends ScryptedDeviceBase implements Camera, VideoCamera,
         this.audioOwner = owner;
         const completion = this.audioCompletion = new Deferred<void>();
         this.intercomError = '';
-        if (owner === 'microphone') this.microphoneReadyOnce = false;
         this.setIntercomState(owner === 'reply' ? 'Quick reply requested' : 'Intercom requested by HomeKit/Scrypted');
         void this.settingsChanged().catch(() => {});
         const generation = ++this.audioGeneration;
@@ -261,7 +258,6 @@ export class Doorbell extends ScryptedDeviceBase implements Camera, VideoCamera,
                 assertCurrent();
             }
             if (session.closed) throw new Error('Doorbell call ended');
-            if (owner === 'microphone') this.microphoneFrameBaseline = session.uplink?.framesSent || 0;
             // File decoders deliver bursts; retain them instead of applying the
             // microphone's short queue, which deliberately drops stale live audio.
             if (session.uplink) session.uplink.maxBufferedFrames = owner === 'reply' ? 64 : 8;
@@ -405,8 +401,6 @@ export class Doorbell extends ScryptedDeviceBase implements Camera, VideoCamera,
         }
         this.audio = paused.child; this.audioSession = paused.session;
         this.audioOwner = 'microphone'; this.audioCompletion = paused.completion;
-        this.microphoneFrameBaseline = paused.session.uplink?.framesSent || 0;
-        this.microphoneReadyOnce = false;
         paused.session.uplink?.clear();
         if (paused.session.uplink) paused.session.uplink.maxBufferedFrames = 8;
         this.setIntercomState('Reply finished; microphone restored');

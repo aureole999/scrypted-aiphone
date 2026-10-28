@@ -95,8 +95,7 @@ export class AiphoneSession extends EventEmitter {
     private answerPromise?: Promise<void>;
     private manualAnswer = false;
     private readonly answerGuards = new Set<() => boolean>();
-    private acceptedAt = 0;
-    private talkAudioReadySince?: number;
+    private callAudioStarted = false;
     private idleTimer?: NodeJS.Timeout;
     private pliTimer?: NodeJS.Timeout;
     private cleanup: (() => void)[] = [];
@@ -107,6 +106,7 @@ export class AiphoneSession extends EventEmitter {
     private peer(): RTCPeerConnection {
         const pc = new RTCPeerConnection({ iceServers: [], bundlePolicy: 'max-bundle', iceUseIpv6: false, codecs: { audio: [usePCMU()], video: [useH264()] } });
         pc.connectionStateChange.subscribe(state => {
+            this.emit('state');
             if (state === 'failed') void this.close().catch(err => this.signaling.log(`Media close: ${err.message}`));
         });
         return pc;
@@ -155,11 +155,7 @@ export class AiphoneSession extends EventEmitter {
                 const sub = track.onReceiveRtp.subscribe(rtp => {
                     if (this.closed) return;
                     if (track.kind === 'audio') {
-                        this.audioPacketsReceived++;
-                        this.audioPayloadType = rtp.header.payloadType;
-                        this.audioLastReceivedAt = Date.now();
-                        this.audioLevelDb = pcmuLevelDb(rtp.payload);
-                        this.audioPeakDb = Math.max(this.audioPeakDb, this.audioLevelDb);
+                        this.receiveAudio(rtp);
                     }
                     else this.videoPacketsReceived++;
                     this.emit('rtp', track.kind, rtp.serialize());
@@ -199,6 +195,17 @@ export class AiphoneSession extends EventEmitter {
             throw err;
         }
     }
+    private receiveAudio(rtp: RtpPacket) {
+        this.audioPacketsReceived++;
+        this.audioPayloadType = rtp.header.payloadType;
+        this.audioLastReceivedAt = Date.now();
+        this.audioLevelDb = pcmuLevelDb(rtp.payload);
+        this.audioPeakDb = Math.max(this.audioPeakDb, this.audioLevelDb);
+        if (this.accepted && !this.callAudioStarted) {
+            this.callAudioStarted = true;
+            this.emit('state');
+        }
+    }
     requestKeyframe() {
         if (this.closed) return;
         const receiver = this.subscriber?.getTransceivers().find(t => t.kind === 'video')?.receiver;
@@ -226,45 +233,54 @@ export class AiphoneSession extends EventEmitter {
         if (this.answerPromise) return this.answerPromise;
         this.answerPromise = this.doAnswer().finally(() => {
             this.answerPromise = undefined; this.manualAnswer = false; this.answerGuards.clear();
+            this.emit('state');
         });
+        this.emit('state');
         return this.answerPromise;
     }
     private shouldAnswer() { return this.manualAnswer || [...this.answerGuards].some(guard => guard()); }
     get answering() { return !!this.answerPromise && !this.accepted && !this.closed; }
-    /** UI readiness concerns packets, including silence, rather than sound level.
-     * A little hysteresis keeps the status readable across network jitter. */
+    /** The first downlink packet after acceptance confirms this call's audio. */
     get talkAudioReady() {
-        const now = Date.now();
-        const ready = !this.closed && this.accepted && this.uplink?.enabled
-            && this.publisher?.connectionState === 'connected' && this.subscriber?.connectionState === 'connected'
-            && this.audioLastReceivedAt !== undefined && this.audioLastReceivedAt >= this.acceptedAt
-            && now - this.audioLastReceivedAt <= 1500;
-        if (!ready) { this.talkAudioReadySince = undefined; return false; }
-        this.talkAudioReadySince ??= now;
-        return now - this.talkAudioReadySince >= 300;
+        return !this.closed && this.accepted && this.callAudioStarted;
     }
-    /** Signaling acceptance can precede the door station's audio path by seconds. */
+    /** Wait on media events only while a prerecorded reply is preparing. */
     async waitForReplyAudio(signal?: AbortSignal, timeoutMs = 15000) {
         this.assertOpen();
         if (!this.accepted || !this.uplink?.enabled) throw new Error('Call has not been accepted; cannot play quick reply');
         const started = Date.now();
-        let readySince: number | undefined;
         this.signaling.log('Quick reply: Waiting for accepted call, connected media, and doorbell audio');
-        while (true) {
-            if (signal?.aborted) throw new Error('Intercom was cancelled');
-            this.assertOpen();
-            const now = Date.now();
-            const freshAudio = this.audioLastReceivedAt !== undefined
-                && this.audioLastReceivedAt >= this.acceptedAt && now - this.audioLastReceivedAt <= 500;
-            if (this.publisher?.connectionState === 'connected' && this.subscriber?.connectionState === 'connected' && freshAudio) {
-                readySince ??= now;
-                // Let the new audio route settle while the uplink sends silence.
-                if (now - readySince >= 300) break;
-            } else readySince = undefined;
-            if (now - started >= timeoutMs)
-                throw new Error(`Timed out waiting for call audio; reply not played: ${JSON.stringify(this.audioDiagnostics)}`);
-            await new Promise(resolve => setTimeout(resolve, 20));
-        }
+        await new Promise<void>((resolve, reject) => {
+            let settled = false;
+            let readyTimer: NodeJS.Timeout | undefined;
+            const ready = () => this.talkAudioReady && this.uplink?.enabled
+                && this.publisher?.connectionState === 'connected' && this.subscriber?.connectionState === 'connected';
+            const finish = (error?: Error) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timeout); clearTimeout(readyTimer);
+                this.off('state', changed); this.off('close', closed);
+                signal?.removeEventListener('abort', cancelled);
+                if (error) reject(error); else resolve();
+            };
+            const cancelled = () => finish(new Error('Intercom was cancelled'));
+            const closed = () => finish(new Error('Doorbell session has ended'));
+            const changed = () => {
+                if (signal?.aborted) { cancelled(); return; }
+                if (this.closed) { closed(); return; }
+                if (!ready()) { clearTimeout(readyTimer); readyTimer = undefined; return; }
+                readyTimer ??= setTimeout(() => {
+                    readyTimer = undefined;
+                    if (ready()) finish();
+                }, 300);
+            };
+            const timeout = setTimeout(() => finish(new Error(
+                `Timed out waiting for call audio; reply not played: ${JSON.stringify(this.audioDiagnostics)}`,
+            )), timeoutMs);
+            this.on('state', changed); this.once('close', closed);
+            signal?.addEventListener('abort', cancelled, { once: true });
+            changed();
+        });
         this.signaling.log(`Quick reply: Call audio ready after ${Date.now() - started} ms; starting playback`);
     }
     private async doAnswer() {
@@ -287,12 +303,13 @@ export class AiphoneSession extends EventEmitter {
                 await this.signaling.request('24002', '25001', this.cid, undefined, { CKIND: this.callKind, RECKIND: 0, AVID: 0, RSLT: 200, REASON: 0 }, 17000);
             }
             this.assertOpen();
-            this.acceptedAt = Date.now();
+            this.callAudioStarted = false;
             this.accepted = true;
             this.talkState = 'Call accepted';
             this.signaling.log('Doorbell accepted talk; microphone uplink enabled');
             this.uplink!.enabled = true;
             this.signaling.answered(this);
+            this.emit('state');
             // Lost remote hangups must never leave an unlimited microphone session.
             if (this.idleTimer) clearTimeout(this.idleTimer);
             this.idleTimer = setTimeout(() => void this.close().catch(() => {}), 300000);
